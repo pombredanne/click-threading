@@ -21,6 +21,9 @@ setup(
     license='MIT',
     packages=['click_threading'],
     install_requires=[
-        'click',
+        'click>=5.0',
     ],
+    extras_require={
+        ':python_version < "3.2"': 'futures'
+    }
 )

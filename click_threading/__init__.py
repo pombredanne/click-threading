@@ -3,6 +3,7 @@
 import sys
 import threading
 import functools
+import contextlib
 import click
 
 from ._compat import reraise
@@ -12,7 +13,17 @@ try:
 except ImportError:
     import Queue as queue
 
-__version__ = '0.1.0'
+# The docs state that "Future should not be instantiated directly, only by
+# Executors", but since I'm basically implementing my own executor here, I
+# think we're fine.
+try:
+    from concurrent.futures import Future
+except ImportError:
+    from futures import Future
+
+__version__ = '0.4.0'
+
+_CTX_WORKER_KEY = __name__ + '.uiworker'
 
 
 def _is_main_thread(thread=None):
@@ -41,45 +52,57 @@ class UiWorker(object):
             raise RuntimeError('The UiWorker can only run on the main thread.')
 
         self.tasks = queue.Queue()
-        self.results = queue.Queue()
 
     def shutdown(self):
-        self.tasks.put(self.SHUTDOWN)
+        self.put(self.SHUTDOWN, wait=False)
 
     def run(self):
         while True:
-            func = self.tasks.get()
+            func, future = self.tasks.get()
             if func is self.SHUTDOWN:
                 return
 
             try:
                 result = func()
-                exc_info = None
-            except BaseException:
-                exc_info = sys.exc_info()
-                result = None
+            except BaseException as e:
+                future.set_exception(e)
+            else:
+                future.set_result(result)
 
-            self.results.put((func, result, exc_info))
+    def put(self, func, wait=True):
+        if _is_main_thread():
+            return func()
 
-    def put(self, func):
-        self.tasks.put(func)
-        orig_func, result, exc_info = self.results.get()
+        future = Future()
+        self.tasks.put((func, future))
+        if not wait:
+            return
 
-        if orig_func is not func:
-            raise RuntimeError('Got the wrong result.')
+        return future.result()
 
-        if exc_info is not None:
-            reraise(*exc_info)
-
-        return result
-
+    @contextlib.contextmanager
     def patch_click(self):
         from .monkey import patch_ui_functions
 
-        def wrapper(f):
+        def wrapper(f, info):
             @functools.wraps(f)
             def inner(*a, **kw):
-                return self.put(lambda: f(*a, **kw))
+                return get_ui_worker() \
+                    .put(lambda: f(*a, **kw), wait=info.interactive)
             return inner
 
-        return patch_ui_functions(wrapper)
+        ctx = click.get_current_context()
+        with patch_ui_functions(wrapper):
+            ctx.meta[_CTX_WORKER_KEY] = self
+            try:
+                yield
+            finally:
+                assert ctx.meta.pop(_CTX_WORKER_KEY) is self
+
+
+def get_ui_worker():
+    try:
+        ctx = click.get_current_context()
+        return ctx.meta[_CTX_WORKER_KEY]
+    except (RuntimeError, KeyError):
+        raise RuntimeError('UI worker not found.')
